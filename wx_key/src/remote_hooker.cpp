@@ -110,11 +110,19 @@ RemoteHooker::~RemoteHooker() {
 }
 
 namespace {
+#ifndef REMOTE_HOOKER_DEBUG_LOG
+#define REMOTE_HOOKER_DEBUG_LOG 0
+#endif
+
     void DebugProtectChange(const char* label, void* address, SIZE_T size, DWORD protect) {
+#if REMOTE_HOOKER_DEBUG_LOG
         char buffer[160]{};
         _snprintf_s(buffer, sizeof(buffer) - 1, _TRUNCATE, "[RemoteHooker] %s addr=%p size=%zu prot=0x%lx\n",
             label, address, static_cast<size_t>(size), static_cast<unsigned long>(protect));
         OutputDebugStringA(buffer);
+#else
+        (void)label; (void)address; (void)size; (void)protect;
+#endif
     }
 
     // 随机填充等长 NOP 序列，降低补丁特征一致性

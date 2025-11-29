@@ -19,11 +19,19 @@ namespace {
         uint64_t vehHandle;
     };
 
+    #ifndef REMOTE_VEH_DEBUG_LOG
+    #define REMOTE_VEH_DEBUG_LOG 0
+    #endif
+
     void DebugProtectChange(const char* label, void* address, SIZE_T size, DWORD protect) {
+    #if REMOTE_VEH_DEBUG_LOG
         char buffer[160]{};
         _snprintf_s(buffer, sizeof(buffer) - 1, _TRUNCATE, "[RemoteVEH] %s addr=%p size=%zu prot=0x%lx\n",
             label, address, static_cast<size_t>(size), static_cast<unsigned long>(protect));
         OutputDebugStringA(buffer);
+    #else
+        (void)label; (void)address; (void)size; (void)protect;
+    #endif
     }
 
     bool SetHardwareBreakpointThread(HANDLE hProcess, DWORD tid, uintptr_t address) {
@@ -86,6 +94,35 @@ namespace {
             } while (Thread32Next(snap, &te));
         }
         CloseHandle(snap);
+    }
+
+    bool QueueApcToProcessThreads(HANDLE hProcess, LPTHREAD_START_ROUTINE routine, PVOID param) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        DWORD pid = GetProcessId(hProcess);
+        bool queued = false;
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID == pid) {
+                    HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                    if (!hThread) {
+                        continue;
+                    }
+                    if (QueueUserAPC((PAPCFUNC)routine, hThread, (ULONG_PTR)param)) {
+                        // 尝试唤醒线程进入 alertable 状态
+                        ResumeThread(hThread);
+                        queued = true;
+                    }
+                    CloseHandle(hThread);
+                }
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+        return queued;
     }
 
     uintptr_t GetRemoteProcAddress(HANDLE hProcess, const char* moduleName, FARPROC localProc) {
@@ -219,12 +256,17 @@ namespace {
         }
         DebugProtectChange("veh block RX", remoteBlock.get(), allocSize, PAGE_EXECUTE_READ);
 
-        HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)regAddr, nullptr, 0, nullptr);
-        if (!hThread) {
-            return false;
+        // 优先使用 APC 触发，避免显式远程线程特征
+        if (!QueueApcToProcessThreads(hProcess, (LPTHREAD_START_ROUTINE)regAddr, nullptr)) {
+            HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)regAddr, nullptr, 0, nullptr);
+            if (!hThread) {
+                return false;
+            }
+            WaitForSingleObject(hThread, 5000);
+            CloseHandle(hThread);
+        } else {
+            Sleep(10); // 给予 APC 执行窗口
         }
-        WaitForSingleObject(hThread, 5000);
-        CloseHandle(hThread);
 
         outHandle.remoteMemory = std::move(remoteBlock);
         outHandle.dataBlock = outHandle.remoteMemory.get();
@@ -271,10 +313,14 @@ void UninstallRemoteVeh(const RemoteVehConfig& cfg, RemoteVehHandle& handle) {
     ClearHardwareBreakpointAllThreads(cfg.hProcess);
 
     if (handle.installed && handle.dataBlock) {
-        HANDLE hThread = CreateRemoteThread(cfg.hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)handle.unregStubAddress, nullptr, 0, nullptr);
-        if (hThread) {
-            WaitForSingleObject(hThread, 5000);
-            CloseHandle(hThread);
+        if (!QueueApcToProcessThreads(cfg.hProcess, (LPTHREAD_START_ROUTINE)handle.unregStubAddress, nullptr)) {
+            HANDLE hThread = CreateRemoteThread(cfg.hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)handle.unregStubAddress, nullptr, 0, nullptr);
+            if (hThread) {
+                WaitForSingleObject(hThread, 5000);
+                CloseHandle(hThread);
+            }
+        } else {
+            Sleep(10);
         }
         handle.remoteMemory.reset();
         handle.dataBlock = nullptr;

@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iomanip>
 #include <random>
+#include <algorithm>
 
 IPCManager::IPCManager()
     : hMapFile(nullptr)
@@ -211,9 +212,15 @@ DWORD WINAPI IPCManager::ListeningThreadProc(LPVOID lpParam) {
 
 void IPCManager::ListeningLoop() {
     // 轮询模式：周期性读取远程进程中的缓冲区
+    DWORD idleBackoff = 0;
+    DWORD failBackoff = 0;
+    int consecutiveEmpty = 0;
+    int consecutiveFail = 0;
     while (!shouldStopListening.load()) {
         // 添加轻微抖动，避免稳定的轮询间隔特征
         DWORD jitteredWait = 80 + (GetTickCount() & 0x3F); // 80-143ms
+        jitteredWait += idleBackoff;
+        jitteredWait += failBackoff;
         DWORD waitResult = WaitForSingleObject(hEvent, jitteredWait);
         if (waitResult == WAIT_OBJECT_0) {
             if (shouldStopListening.load()) {
@@ -223,8 +230,10 @@ void IPCManager::ListeningLoop() {
         }
 
         if (!hTargetProcess || !pRemoteBuffer) {
+            idleBackoff = std::min<DWORD>(idleBackoff + 20, 200);
             continue;
         }
+        idleBackoff = 0;
         
         // 从远程进程读取数据
         SharedKeyData keyData;
@@ -240,6 +249,7 @@ void IPCManager::ListeningLoop() {
         );
         
         if (readResult && bytesRead == sizeof(SharedKeyData)) {
+            consecutiveFail = 0;
             // 检查是否有新数据（通过序列号判断）
             if (keyData.dataSize > 0 && 
                 keyData.dataSize <= 32 && 
@@ -265,7 +275,16 @@ void IPCManager::ListeningLoop() {
                     sizeof(SharedKeyData),
                     &bytesWritten
                 );
+                consecutiveEmpty = 0;
+                failBackoff = 0;
+            } else {
+                // 无新数据时逐步增加空闲退避
+                consecutiveEmpty++;
+                idleBackoff = std::min<DWORD>(80 + consecutiveEmpty * 10, 400);
             }
+        } else {
+            consecutiveFail++;
+            failBackoff = std::min<DWORD>(consecutiveFail * 20, 400);
         }
     }
 }
